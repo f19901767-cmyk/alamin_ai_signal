@@ -11,7 +11,7 @@ def send_telegram(text):
     r = requests.post(
         f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
         json={"chat_id": CHAT_ID, "text": text}, timeout=20
-    )
+   print("Telegram API response:", r.text) )
     r.raise_for_status()
     if not r.json().get("ok"):
         raise RuntimeError("Telegram API did not accept the message")
