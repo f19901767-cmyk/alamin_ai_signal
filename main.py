@@ -188,13 +188,14 @@ def analyze():
     )
 
     message = (
-        f"EUR/JPY ( REAL MARKET )\n"
-        f"SIGNAL : {signal}\n"
-        f"ENTRY TIME : {entry.strftime('%H:%M')}\n"
-        f"TIMEFRAME : 1 MINUTE\n"
-        f"DIRECTION : {direction}\n"
-        f"ANALYSIS : {reason}\n"
-        f"ALAMIN SIGNAL 01883312072"
+        message = (
+    f"EUR/JPY ( REAL MARKET )\n"
+    f"SIGNAL : {signal}\n"
+    f"ENTRY TIME : {entry.strftime('%H:%M')}\n"
+    f"TIMEFRAME : 1 MINUTE\n"
+    f"DIRECTION : {direction}\n"
+    f"ALAMIN SIGNAL 01883312072"
+)
     )
 
     return message
