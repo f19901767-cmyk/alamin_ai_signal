@@ -1,4 +1,3 @@
-
 import os
 import time
 import requests
@@ -7,241 +6,262 @@ from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 # ===== SETTINGS =====
-BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
-API_KEY = os.environ["TWELVE_DATA_API_KEY"]
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
 
-TIMEZONE = ZoneInfo("Asia/Dhaka")
 SYMBOL = "EUR/JPY"
-TIMEFRAME = "1min"
+INTERVAL = "1min"
+TIMEZONE = ZoneInfo("Asia/Dhaka")
+SIGNATURE = "ALAMIN SIGNAL 01883312072"
+
+BASE_URL = "https://api.twelvedata.com/time_series"
 
 
 def send_telegram(message):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        raise RuntimeError(
+            "Missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID secret."
+        )
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+
     response = requests.post(
         url,
-        data={"chat_id": CHAT_ID, "text": message},
-        timeout=20,
+        data={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": message
+        },
+        timeout=20
     )
+
     response.raise_for_status()
-    if not response.json().get("ok"):
-        raise RuntimeError("Telegram message failed.")
+    result = response.json()
+
+    if not result.get("ok"):
+        raise RuntimeError(
+            f"Telegram API error: {result.get('description', 'unknown error')}"
+        )
 
 
 def get_candles(outputsize=150):
+    if not TWELVE_DATA_API_KEY:
+        raise RuntimeError("Missing TWELVE_DATA_API_KEY secret.")
+
     response = requests.get(
-        "https://api.twelvedata.com/time_series",
+        BASE_URL,
         params={
             "symbol": SYMBOL,
-            "interval": TIMEFRAME,
+            "interval": INTERVAL,
             "outputsize": outputsize,
-            "apikey": API_KEY,
-            "format": "JSON",
             "timezone": "Asia/Dhaka",
+            "apikey": TWELVE_DATA_API_KEY
         },
-        timeout=20,
+        timeout=25
     )
-    response.raise_for_status()
-    data = response.json()
 
-    if "values" not in data:
+    response.raise_for_status()
+    payload = response.json()
+
+    if payload.get("status") == "error" or "values" not in payload:
         raise RuntimeError(
-            "Market data error: " + str(data.get("message", data))
+            f"Twelve Data API error: {payload.get('message', 'No candle data')}"
         )
 
-    df = pd.DataFrame(data["values"])
+    df = pd.DataFrame(payload["values"])
+
+    if df.empty or "datetime" not in df.columns:
+        raise RuntimeError("Market data is empty or missing timestamps.")
+
+    for column in ["open", "high", "low", "close"]:
+        df[column] = pd.to_numeric(df[column], errors="coerce")
+
     df["datetime"] = pd.to_datetime(
         df["datetime"], errors="coerce"
     )
 
-    for col in ["open", "high", "low", "close"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-
     df = (
         df.dropna(subset=["datetime", "open", "high", "low", "close"])
+        .drop_duplicates(subset=["datetime"])
         .sort_values("datetime")
-        .drop_duplicates("datetime")
         .reset_index(drop=True)
     )
 
-    if len(df) < 50:
-        raise RuntimeError("Not enough candles for analysis.")
+    if len(df) < 2:
+        raise RuntimeError("Not enough candles from market data.")
 
     return df
 
 
-def analyze():
-    df = get_candles()
-    close = df["close"]
+def calculate_rsi(series, period=14):
+    delta = series.diff()
 
-    # EMA 9 and EMA 21
-    df["ema9"] = close.ewm(span=9, adjust=False).mean()
-    df["ema21"] = close.ewm(span=21, adjust=False).mean()
-
-    # RSI 14
-    delta = close.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
 
     avg_gain = gain.ewm(
-        alpha=1 / 14, min_periods=14, adjust=False
+        alpha=1 / period,
+        min_periods=period,
+        adjust=False
     ).mean()
+
     avg_loss = loss.ewm(
-        alpha=1 / 14, min_periods=14, adjust=False
+        alpha=1 / period,
+        min_periods=period,
+        adjust=False
     ).mean()
 
-    rs = avg_gain / avg_loss.replace(0, float("nan"))
-    df["rsi"] = (100 - (100 / (1 + rs))).fillna(50)
+    relative_strength = avg_gain / avg_loss.replace(0, float("nan"))
+    rsi = 100 - (100 / (1 + relative_strength))
 
-    # Bollinger Bands (20, 2)
-    df["bb_mid"] = close.rolling(20).mean()
-    std = close.rolling(20).std(ddof=0)
-    df["bb_upper"] = df["bb_mid"] + 2 * std
-    df["bb_lower"] = df["bb_mid"] - 2 * std
+    return rsi.fillna(50)
 
-    # Use a completed candle only
-    now = datetime.now(TIMEZONE)
-    current_minute = now.replace(second=0, microsecond=0)
-    latest = df.iloc[-1]["datetime"]
 
-    if latest == current_minute.replace(tzinfo=None):
-        df = df.iloc[:-1].copy()
+def analyze():
+    df = get_candles(outputsize=150)
 
-    last = df.iloc[-1]
-    previous = df.iloc[-2]
+    if len(df) < 50:
+        raise RuntimeError("Not enough candles for signal analysis.")
+
+    # Indicators are used internally only.
+    df["ema9"] = df["close"].ewm(
+        span=9, adjust=False
+    ).mean()
+
+    df["ema21"] = df["close"].ewm(
+        span=21, adjust=False
+    ).mean()
+
+    df["rsi14"] = calculate_rsi(df["close"], 14)
+
+    df["bb_mid"] = df["close"].rolling(20).mean()
+
+    bb_std = df["close"].rolling(20).std(ddof=0)
+
+    df["bb_upper"] = df["bb_mid"] + (2 * bb_std)
+    df["bb_lower"] = df["bb_mid"] - (2 * bb_std)
+
+    # Ignore the latest candle because it may still be forming.
+    row = df.iloc[-2]
 
     call_score = 0
     put_score = 0
 
-    # EMA trend and crossover
-    if last["ema9"] > last["ema21"]:
-        call_score += 2
-    elif last["ema9"] < last["ema21"]:
-        put_score += 2
-
-    if previous["ema9"] <= previous["ema21"] and last["ema9"] > last["ema21"]:
+    if row["ema9"] > row["ema21"]:
         call_score += 1
-
-    if previous["ema9"] >= previous["ema21"] and last["ema9"] < last["ema21"]:
+    elif row["ema9"] < row["ema21"]:
         put_score += 1
 
-    # RSI
-    rsi = float(last["rsi"])
-
-    if 50 < rsi < 70:
-        call_score += 2
-    elif 30 < rsi < 50:
-        put_score += 2
-    elif rsi >= 70:
-        put_score += 1
-    elif rsi <= 30:
+    if row["rsi14"] >= 50:
         call_score += 1
-
-    # Bollinger Bands
-    price = float(last["close"])
-
-    if price > last["bb_mid"]:
-        call_score += 1
-    elif price < last["bb_mid"]:
-        put_score += 1
-
-    if price <= last["bb_lower"]:
-        call_score += 1
-
-    if price >= last["bb_upper"]:
-        put_score += 1
-
-    # Always CALL or PUT
-    if call_score > put_score:
-        signal, direction = "CALL", "UP"
-    elif put_score > call_score:
-        signal, direction = "PUT", "DOWN"
-    elif last["ema9"] >= last["ema21"]:
-        signal, direction = "CALL", "UP"
     else:
-        signal, direction = "PUT", "DOWN"
+        put_score += 1
 
-    entry = (datetime.now(TIMEZONE) + timedelta(minutes=1))
-    entry = entry.replace(second=0, microsecond=0)
+    if row["close"] > row["bb_mid"]:
+        call_score += 1
+    elif row["close"] < row["bb_mid"]:
+        put_score += 1
 
-    message = (
-        "EUR/JPY ( REAL MARKET )\n"
-        f"SIGNAL : {signal}\n"
-        f"ENTRY TIME : {entry.strftime('%H:%M')}\n"
-        "TIMEFRAME : 1 MINUTE\n"
-        f"DIRECTION : {direction}\n"
-        "ALAMIN SIGNAL 01883312072"
+    # CALL or PUT only.
+    if call_score > put_score:
+        signal = "CALL"
+    elif put_score > call_score:
+        signal = "PUT"
+    else:
+        signal = "CALL" if row["ema9"] >= row["ema21"] else "PUT"
+
+    now = datetime.now(TIMEZONE)
+
+    # Entry at the next full minute.
+    entry_time = (
+        now.replace(second=0, microsecond=0)
+        + timedelta(minutes=1)
     )
 
-    return signal, entry, message
+    return signal, entry_time
 
 
 def find_entry_candle(entry_time):
-    target = entry_time.replace(tzinfo=None, second=0, microsecond=0)
+    df = get_candles(outputsize=20)
 
-    for _ in range(6):
-        df = get_candles(outputsize=20)
-        stamps = df["datetime"]
+    target = entry_time.replace(
+        tzinfo=None,
+        second=0,
+        microsecond=0
+    )
 
-        match = df[
-            (stamps.dt.year == target.year)
-            & (stamps.dt.month == target.month)
-            & (stamps.dt.day == target.day)
-            & (stamps.dt.hour == target.hour)
-            & (stamps.dt.minute == target.minute)
-        ]
+    matches = df[df["datetime"] == target]
 
-        if not match.empty:
-            return match.iloc[-1]
+    if matches.empty:
+        return None
 
-        time.sleep(10)
-
-    return None
+    return matches.iloc[-1]
 
 
 def check_result(signal, entry_time):
-    # Wait until the entry minute has closed
-    expiry = entry_time + timedelta(minutes=1)
-    wait = (expiry - datetime.now(TIMEZONE)).total_seconds()
+    check_at = entry_time + timedelta(minutes=1, seconds=8)
 
-    if wait > 0:
-        time.sleep(wait)
+    wait_seconds = (
+        check_at - datetime.now(TIMEZONE)
+    ).total_seconds()
 
-    # Allow market data time to update
-    time.sleep(8)
+    if wait_seconds > 0:
+        time.sleep(wait_seconds)
 
-    candle = find_entry_candle(entry_time)
+    try:
+        candle = find_entry_candle(entry_time)
 
-    if candle is None:
-        result = "UNAVAILABLE"
-    else:
+        if candle is None:
+            return "UNAVAILABLE"
+
         open_price = float(candle["open"])
         close_price = float(candle["close"])
 
         if close_price == open_price:
-            result = "DRAW"
-        elif signal == "CALL":
-            result = "PROFIT" if close_price > open_price else "LOSS"
-        else:
-            result = "PROFIT" if close_price < open_price else "LOSS"
+            return "DRAW"
 
-    send_telegram(
-        "EUR/JPY ( REAL MARKET )\n"
+        if signal == "CALL":
+            return "PROFIT" if close_price > open_price else "LOSS"
+
+        return "PROFIT" if close_price < open_price else "LOSS"
+
+    except Exception as exc:
+        print(f"Result check failed: {exc}")
+        return "UNAVAILABLE"
+
+
+def main():
+    signal, entry_time = analyze()
+
+    direction = "UP" if signal == "CALL" else "DOWN"
+
+    signal_message = (
+        f"{SYMBOL} ( REAL MARKET )\n"
         f"SIGNAL : {signal}\n"
         f"ENTRY TIME : {entry_time.strftime('%H:%M')}\n"
-        "TIMEFRAME : 1 MINUTE\n"
-        f"RESULT : {result}\n"
-        "ALAMIN SIGNAL 01883312072"
+        f"TIMEFRAME : 1 MINUTE\n"
+        f"DIRECTION : {direction}\n"
+        f"{SIGNATURE}"
     )
+
+    send_telegram(signal_message)
+    print("Signal sent:", signal_message)
+
+    result = check_result(signal, entry_time)
+
+    result_message = (
+        f"{SYMBOL} ( REAL MARKET )\n"
+        f"RESULT : {result}\n"
+        f"{SIGNATURE}"
+    )
+
+    send_telegram(result_message)
+    print("Result sent:", result_message)
 
 
 if __name__ == "__main__":
     try:
-        signal, entry_time, message = analyze()
-        send_telegram(message)
-        print("Signal sent. Waiting for result...")
-        check_result(signal, entry_time)
-        print("Result message sent.")
-    except Exception as error:
-        print(f"Error: {error}")
+        main()
+    except Exception as exc:
+        print(f"Bot error: {exc}")
         raise
