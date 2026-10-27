@@ -1,547 +1,552 @@
+
 import os
-import time
+import json
 import requests
 import pandas as pd
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
+from datetime import datetime
+from pathlib import Path
 
-# ================= SETTINGS =================
+# =============== CONFIGURATION ===============
+API_KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "").strip()
+SYMBOL = os.getenv("SYMBOL", "EUR/JPY")
+MARKET_LABEL = os.getenv("MARKET_LABEL", "REAL MARKET")
+TIMEFRAME = "1min"
+CONFIRM_TIMEFRAME = "5min"
+MIN_SCORE = 6
 
-SYMBOL = "EUR/JPY"
-INTERVAL = "1min"
-TZ = ZoneInfo("Asia/Dhaka")
-SIGNATURE = "ALAMIN SIGNAL 01883312072"
-
-API_URL = "https://api.twelvedata.com/time_series"
+STATE_FILE = Path("alamin_state.json")
+BOT_NAME = "ALAMIN SIGNAL"
+# =============================================
 
 
-# ================= TELEGRAM =================
-
-def send_telegram(message):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        raise RuntimeError("Telegram Secrets missing.")
-
-    url = (
-        f"https://api.telegram.org/"
-        f"bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    )
-
+def telegram_send(message):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     response = requests.post(
         url,
-        data={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": message
+        json={"chat_id": CHAT_ID, "text": message},
+        timeout=20
+    )
+    response.raise_for_status()
+
+    if not response.json().get("ok"):
+        raise RuntimeError("Telegram message could not be sent")
+
+
+def get_candles(interval="1min", size=200):
+    response = requests.get(
+        "https://api.twelvedata.com/time_series",
+        params={
+            "symbol": SYMBOL,
+            "interval": interval,
+            "outputsize": size,
+            "apikey": API_KEY,
+            "timezone": "UTC",
+            "format": "JSON"
         },
         timeout=20
     )
-
-    response.raise_for_status()
-    result = response.json()
-
-    if not result.get("ok"):
-        raise RuntimeError(result.get("description", "Telegram error"))
-
-
-# ================= MARKET DATA =================
-
-def get_candles(outputsize=200):
-    if not TWELVE_DATA_API_KEY:
-        raise RuntimeError("Twelve Data API key missing.")
-
-    response = requests.get(
-        API_URL,
-        params={
-            "symbol": SYMBOL,
-            "interval": INTERVAL,
-            "outputsize": outputsize,
-            "timezone": "Asia/Dhaka",
-            "apikey": TWELVE_DATA_API_KEY
-        },
-        timeout=25
-    )
-
     response.raise_for_status()
     data = response.json()
 
-    if data.get("status") == "error" or "values" not in data:
+    if "values" not in data:
         raise RuntimeError(
-            data.get("message", "Market data unavailable.")
+            f"Market data error: {data.get('message', data)}"
         )
 
     df = pd.DataFrame(data["values"])
-
-    if df.empty:
-        raise RuntimeError("No market candles returned.")
 
     for col in ["open", "high", "low", "close"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
     df["datetime"] = pd.to_datetime(
-        df["datetime"], errors="coerce"
+        df["datetime"], utc=True, errors="coerce"
     )
 
     df = (
-        df.dropna(
-            subset=[
-                "datetime", "open", "high", "low", "close"
-            ]
-        )
-        .drop_duplicates(subset=["datetime"])
+        df.dropna(subset=["datetime", "open", "high", "low", "close"])
         .sort_values("datetime")
+        .drop_duplicates("datetime")
         .reset_index(drop=True)
     )
 
-    if len(df) < 100:
-        raise RuntimeError("Not enough candles for analysis.")
+    if len(df) < 80:
+        raise RuntimeError("Not enough candles for analysis")
 
-    return df
+    # বাদ দাও বর্তমান অসম্পূর্ণ ক্যান্ডেল
+    return df.iloc[:-1].copy().reset_index(drop=True)
 
 
-# ================= INDICATORS =================
+def add_indicators(df):
+    x = df.copy()
 
-def calculate_rsi(close, period=14):
-    delta = close.diff()
+    # EMA 9, 21, 50
+    for period in [9, 21, 50]:
+        x[f"ema{period}"] = x["close"].ewm(
+            span=period, adjust=False
+        ).mean()
 
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-
-    avg_gain = gain.ewm(
-        alpha=1 / period,
-        min_periods=period,
-        adjust=False
+    # RSI 14
+    delta = x["close"].diff()
+    gain = delta.clip(lower=0).ewm(
+        alpha=1/14, adjust=False
+    ).mean()
+    loss = (-delta.clip(upper=0)).ewm(
+        alpha=1/14, adjust=False
     ).mean()
 
-    avg_loss = loss.ewm(
-        alpha=1 / period,
-        min_periods=period,
-        adjust=False
-    ).mean()
-
-    rs = avg_gain / avg_loss.replace(0, float("nan"))
-    rsi = 100 - (100 / (1 + rs))
-
-    return rsi.fillna(50)
-
-
-def calculate_adx(df, period=14):
-    high = df["high"]
-    low = df["low"]
-    close = df["close"]
-
-    up_move = high.diff()
-    down_move = -low.diff()
-
-    plus_dm = up_move.where(
-        (up_move > down_move) & (up_move > 0), 0.0
-    )
-
-    minus_dm = down_move.where(
-        (down_move > up_move) & (down_move > 0), 0.0
-    )
-
-    tr = pd.concat(
-        [
-            high - low,
-            (high - close.shift()).abs(),
-            (low - close.shift()).abs()
-        ],
-        axis=1
-    ).max(axis=1)
-
-    atr = tr.ewm(
-        alpha=1 / period, adjust=False
-    ).mean()
-
-    plus_di = (
-        100 * plus_dm.ewm(
-            alpha=1 / period, adjust=False
-        ).mean() / atr.replace(0, float("nan"))
-    )
-
-    minus_di = (
-        100 * minus_dm.ewm(
-            alpha=1 / period, adjust=False
-        ).mean() / atr.replace(0, float("nan"))
-    )
-
-    dx = (
-        100 * (plus_di - minus_di).abs()
-        / (plus_di + minus_di).replace(0, float("nan"))
-    )
-
-    adx = dx.ewm(
-        alpha=1 / period, adjust=False
-    ).mean()
-
-    return plus_di.fillna(0), minus_di.fillna(0), adx.fillna(0)
-
-
-def calculate_psar(df, step=0.02, maximum=0.2):
-    high = df["high"].tolist()
-    low = df["low"].tolist()
-
-    psar = [low[0]] * len(df)
-    bullish = True
-    extreme = high[0]
-    acceleration = step
-
-    for i in range(1, len(df)):
-        previous = psar[i - 1]
-
-        if bullish:
-            current = previous + acceleration * (
-                extreme - previous
-            )
-            current = min(current, low[i - 1])
-
-            if i >= 2:
-                current = min(current, low[i - 2])
-
-            if low[i] < current:
-                bullish = False
-                current = extreme
-                extreme = low[i]
-                acceleration = step
-            elif high[i] > extreme:
-                extreme = high[i]
-                acceleration = min(
-                    acceleration + step, maximum
-                )
-
-        else:
-            current = previous + acceleration * (
-                extreme - previous
-            )
-            current = max(current, high[i - 1])
-
-            if i >= 2:
-                current = max(current, high[i - 2])
-
-            if high[i] > current:
-                bullish = True
-                current = extreme
-                extreme = high[i]
-                acceleration = step
-            elif low[i] < extreme:
-                extreme = low[i]
-                acceleration = min(
-                    acceleration + step, maximum
-                )
-
-        psar[i] = current
-
-    return pd.Series(psar, index=df.index)
-
-
-# ================= ANALYSIS =================
-
-def analyze():
-    df = get_candles(200)
-
-    # Exclude the newest candle because it may still be forming.
-    df = df.iloc[:-1].copy().reset_index(drop=True)
-
-    if len(df) < 100:
-        raise RuntimeError("Not enough completed candles.")
-
-    close = df["close"]
-    high = df["high"]
-    low = df["low"]
-    open_price = df["open"]
-
-    # Trend
-    df["ema9"] = close.ewm(span=9, adjust=False).mean()
-    df["ema21"] = close.ewm(span=21, adjust=False).mean()
-    df["ema50"] = close.ewm(span=50, adjust=False).mean()
-    df["ema200"] = close.ewm(span=200, adjust=False).mean()
-
-    # RSI
-    df["rsi"] = calculate_rsi(close, 14)
+    rs = gain / loss.replace(0, float("nan"))
+    x["rsi"] = (100 - 100 / (1 + rs)).fillna(50)
 
     # MACD
-    ema12 = close.ewm(span=12, adjust=False).mean()
-    ema26 = close.ewm(span=26, adjust=False).mean()
-
-    df["macd"] = ema12 - ema26
-    df["macd_signal"] = df["macd"].ewm(
+    ema12 = x["close"].ewm(span=12, adjust=False).mean()
+    ema26 = x["close"].ewm(span=26, adjust=False).mean()
+    x["macd"] = ema12 - ema26
+    x["macd_signal"] = x["macd"].ewm(
         span=9, adjust=False
     ).mean()
 
-    # Bollinger Bands
-    df["bb_mid"] = close.rolling(20).mean()
-    bb_std = close.rolling(20).std(ddof=0)
-
-    df["bb_upper"] = df["bb_mid"] + 2 * bb_std
-    df["bb_lower"] = df["bb_mid"] - 2 * bb_std
-
-    # Stochastic oscillator
-    lowest = low.rolling(14).min()
-    highest = high.rolling(14).max()
-
-    df["stoch_k"] = (
-        100 * (close - lowest)
-        / (highest - lowest).replace(0, float("nan"))
-    )
-
-    df["stoch_d"] = df["stoch_k"].rolling(3).mean()
-
     # ATR
-    tr = pd.concat(
-        [
-            high - low,
-            (high - close.shift()).abs(),
-            (low - close.shift()).abs()
-        ],
-        axis=1
-    ).max(axis=1)
+    previous_close = x["close"].shift(1)
+    tr = pd.concat([
+        x["high"] - x["low"],
+        (x["high"] - previous_close).abs(),
+        (x["low"] - previous_close).abs()
+    ], axis=1).max(axis=1)
 
-    df["atr"] = tr.ewm(
-        alpha=1 / 14, adjust=False
+    x["atr"] = tr.ewm(alpha=1/14, adjust=False).mean()
+
+    # ADX approximation
+    up = x["high"].diff()
+    down = -x["low"].diff()
+
+    plus_dm = up.where((up > down) & (up > 0), 0.0)
+    minus_dm = down.where((down > up) & (down > 0), 0.0)
+
+    atr_safe = x["atr"].replace(0, float("nan"))
+    plus_di = 100 * plus_dm.ewm(
+        alpha=1/14, adjust=False
+    ).mean() / atr_safe
+    minus_di = 100 * minus_dm.ewm(
+        alpha=1/14, adjust=False
+    ).mean() / atr_safe
+
+    dx = 100 * (plus_di - minus_di).abs() / (
+        plus_di + minus_di
+    ).replace(0, float("nan"))
+
+    x["adx"] = dx.ewm(
+        alpha=1/14, adjust=False
+    ).mean().fillna(0)
+
+    # Bollinger Bands
+    middle = x["close"].rolling(20).mean()
+    deviation = x["close"].rolling(20).std()
+
+    x["bb_mid"] = middle
+    x["bb_upper"] = middle + 2 * deviation
+    x["bb_lower"] = middle - 2 * deviation
+
+    # Keltner Channel
+    x["kc_mid"] = x["close"].ewm(
+        span=20, adjust=False
     ).mean()
+    x["kc_upper"] = x["kc_mid"] + 1.5 * x["atr"]
+    x["kc_lower"] = x["kc_mid"] - 1.5 * x["atr"]
 
-    # ADX and directional movement
-    df["plus_di"], df["minus_di"], df["adx"] = (
-        calculate_adx(df, 14)
-    )
+    return x
 
-    # CCI
-    typical = (high + low + close) / 3
-    typical_mean = typical.rolling(20).mean()
 
-    mean_deviation = typical.rolling(20).apply(
-        lambda x: abs(x - x.mean()).mean(),
-        raw=True
-    )
+def find_swings(df, window=3):
+    highs, lows = [], []
 
-    df["cci"] = (
-        (typical - typical_mean)
-        / (0.015 * mean_deviation).replace(0, float("nan"))
-    )
+    for i in range(window, len(df) - window):
+        if df["high"].iloc[i] >= df["high"].iloc[
+            i-window:i+window+1
+        ].max():
+            highs.append((i, float(df["high"].iloc[i])))
 
-    # Williams %R
-    df["williams"] = (
-        -100 * (highest - close)
-        / (highest - lowest).replace(0, float("nan"))
-    )
+        if df["low"].iloc[i] <= df["low"].iloc[
+            i-window:i+window+1
+        ].min():
+            lows.append((i, float(df["low"].iloc[i])))
 
-    # Parabolic SAR
-    df["psar"] = calculate_psar(df)
+    return highs, lows
 
-    row = df.iloc[-1]
+
+def analyze_market(raw, higher_raw):
+    df = add_indicators(raw)
+    higher = add_indicators(higher_raw)
+
+    last = df.iloc[-1]
     prev = df.iloc[-2]
+
+    price = float(last["close"])
+    atr = max(float(last["atr"]), abs(price) * 0.00001)
+    tolerance = atr * 0.25
 
     call_score = 0
     put_score = 0
+    reasons = []
 
-    # EMA trend
-    if row["ema9"] > row["ema21"]:
-        call_score += 2
-    else:
-        put_score += 2
+    def add(side, points, label):
+        nonlocal call_score, put_score
 
-    if row["ema21"] > row["ema50"]:
-        call_score += 2
-    else:
-        put_score += 2
+        if side == "CALL":
+            call_score += points
+            reasons.append(f"CALL: {label}")
+        elif side == "PUT":
+            put_score += points
+            reasons.append(f"PUT: {label}")
 
-    if row["ema50"] > row["ema200"]:
-        call_score += 2
-    else:
-        put_score += 2
+    # 1. Pivot Points
+    prior = raw.iloc[-2]
+    ph = float(prior["high"])
+    pl = float(prior["low"])
+    pc = float(prior["close"])
+    pivot = (ph + pl + pc) / 3
 
-    # RSI
-    if row["rsi"] > 55:
-        call_score += 1
-    elif row["rsi"] < 45:
-        put_score += 1
+    if price > pivot:
+        add("CALL", 1, "Above Pivot")
+    elif price < pivot:
+        add("PUT", 1, "Below Pivot")
 
-    # MACD
-    if row["macd"] > row["macd_signal"]:
-        call_score += 2
-    else:
-        put_score += 2
-
-    # Bollinger middle line
-    if row["close"] > row["bb_mid"]:
-        call_score += 1
-    else:
-        put_score += 1
-
-    # Stochastic
-    if row["stoch_k"] > row["stoch_d"]:
-        call_score += 1
-    else:
-        put_score += 1
-
-    # ADX directional trend
-    if row["adx"] >= 20:
-        if row["plus_di"] > row["minus_di"]:
-            call_score += 2
-        elif row["minus_di"] > row["plus_di"]:
-            put_score += 2
-
-    # CCI
-    if row["cci"] > 0:
-        call_score += 1
-    else:
-        put_score += 1
-
-    # Williams %R
-    if row["williams"] > -50:
-        call_score += 1
-    else:
-        put_score += 1
-
-    # Parabolic SAR
-    if row["close"] > row["psar"]:
-        call_score += 1
-    else:
-        put_score += 1
-
-    # Candle momentum
-    if row["close"] > row["open"]:
-        call_score += 1
-    elif row["close"] < row["open"]:
-        put_score += 1
-
-    # Previous candle movement
-    if row["close"] > prev["close"]:
-        call_score += 1
-    elif row["close"] < prev["close"]:
-        put_score += 1
-
-    # Support and resistance: recent 20-candle levels
-    recent = df.iloc[-21:-1]
-    support = recent["low"].min()
-    resistance = recent["high"].max()
-
-    if row["close"] > (support + resistance) / 2:
-        call_score += 1
-    elif row["close"] < (support + resistance) / 2:
-        put_score += 1
-
-    # Basic candlestick body confirmation
-    body = abs(row["close"] - row["open"])
-    candle_range = row["high"] - row["low"]
-
-    if candle_range > 0 and body / candle_range >= 0.5:
-        if row["close"] > row["open"]:
-            call_score += 1
-        elif row["close"] < row["open"]:
-            put_score += 1
-
-    # ATR is used to assess volatility; it does not predict direction.
-    if pd.isna(row["atr"]) or row["atr"] <= 0:
-        raise RuntimeError("Volatility data unavailable.")
-
-    # Always return CALL or PUT, as requested.
-    if call_score > put_score:
-        signal = "CALL"
-    elif put_score > call_score:
-        signal = "PUT"
-    else:
-        signal = (
-            "CALL"
-            if row["ema9"] >= row["ema21"]
-            else "PUT"
-        )
-
-    now = datetime.now(TZ)
-    entry_time = (
-        now.replace(second=0, microsecond=0)
-        + timedelta(minutes=1)
+    # 2. Fibonacci Retracement
+    swing_highs, swing_lows = find_swings(
+        raw.tail(100).reset_index(drop=True)
     )
 
-    return signal, entry_time
-
-
-# ================= RESULT CHECK =================
-
-def find_entry_candle(entry_time):
-    df = get_candles(20)
-
-    target = entry_time.replace(
-        tzinfo=None, second=0, microsecond=0
+    swing_high = max(
+        [v for _, v in swing_highs[-5:]],
+        default=float(raw["high"].tail(50).max())
+    )
+    swing_low = min(
+        [v for _, v in swing_lows[-5:]],
+        default=float(raw["low"].tail(50).min())
     )
 
-    matches = df[df["datetime"] == target]
+    span = max(swing_high - swing_low, tolerance)
+    fib_levels = [
+        swing_high - span * 0.382,
+        swing_high - span * 0.500,
+        swing_high - span * 0.618
+    ]
 
-    if matches.empty:
-        return None
+    if any(abs(price - level) <= tolerance for level in fib_levels):
+        if price >= float(last["ema21"]):
+            add("CALL", 1, "Fibonacci zone")
+        else:
+            add("PUT", 1, "Fibonacci zone")
 
-    return matches.iloc[-1]
+    # 3. Price Action / Candlestick
+    body = abs(float(last["close"]) - float(last["open"]))
+    lower_wick = min(
+        float(last["close"]), float(last["open"])
+    ) - float(last["low"])
+    upper_wick = float(last["high"]) - max(
+        float(last["close"]), float(last["open"])
+    )
+
+    bullish_engulf = (
+        last["close"] > last["open"]
+        and prev["close"] < prev["open"]
+        and last["close"] >= prev["open"]
+        and last["open"] <= prev["close"]
+    )
+
+    bearish_engulf = (
+        last["close"] < last["open"]
+        and prev["close"] > prev["open"]
+        and last["close"] <= prev["open"]
+        and last["open"] >= prev["close"]
+    )
+
+    if bullish_engulf or (
+        lower_wick > max(body * 2, tolerance)
+        and last["close"] > last["open"]
+    ):
+        add("CALL", 1, "Bullish price action")
+
+    if bearish_engulf or (
+        upper_wick > max(body * 2, tolerance)
+        and last["close"] < last["open"]
+    ):
+        add("PUT", 1, "Bearish price action")
+
+    # 4. Trend Following: EMA + ADX
+    if (
+        last["ema9"] > last["ema21"] > last["ema50"]
+        and last["adx"] >= 18
+    ):
+        add("CALL", 2, "EMA/ADX uptrend")
+
+    elif (
+        last["ema9"] < last["ema21"] < last["ema50"]
+        and last["adx"] >= 18
+    ):
+        add("PUT", 2, "EMA/ADX downtrend")
+
+    # 5. RSI / MACD Divergence
+    tail = df.tail(100).reset_index(drop=True)
+    highs, lows = find_swings(tail)
+
+    if len(lows) >= 2:
+        i1, p1 = lows[-2]
+        i2, p2 = lows[-1]
+
+        if (
+            p2 < p1
+            and tail["rsi"].iloc[i2] > tail["rsi"].iloc[i1] + 3
+        ):
+            add("CALL", 1, "Bullish RSI divergence")
+
+        if (
+            p2 < p1
+            and tail["macd"].iloc[i2] > tail["macd"].iloc[i1]
+        ):
+            add("CALL", 1, "Bullish MACD divergence")
+
+    if len(highs) >= 2:
+        i1, p1 = highs[-2]
+        i2, p2 = highs[-1]
+
+        if (
+            p2 > p1
+            and tail["rsi"].iloc[i2] < tail["rsi"].iloc[i1] - 3
+        ):
+            add("PUT", 1, "Bearish RSI divergence")
+
+        if (
+            p2 > p1
+            and tail["macd"].iloc[i2] < tail["macd"].iloc[i1]
+        ):
+            add("PUT", 1, "Bearish MACD divergence")
+
+    # 6. Breakout & Retest
+    range_high = float(df["high"].iloc[-22:-2].max())
+    range_low = float(df["low"].iloc[-22:-2].min())
+
+    if (
+        price > range_high
+        and float(prev["low"]) <= range_high + tolerance
+    ):
+        add("CALL", 1, "Breakout/retest")
+
+    elif (
+        price < range_low
+        and float(prev["high"]) >= range_low - tolerance
+    ):
+        add("PUT", 1, "Breakdown/retest")
+
+    # 7. Volatility Squeeze
+    squeeze = (
+        float(prev["bb_upper"]) < float(prev["kc_upper"])
+        and float(prev["bb_lower"]) > float(prev["kc_lower"])
+    )
+
+    if squeeze:
+        if price > float(last["bb_mid"]):
+            add("CALL", 1, "Volatility squeeze")
+        elif price < float(last["bb_mid"]):
+            add("PUT", 1, "Volatility squeeze")
+
+    # 8. Multi-Timeframe Analysis
+    h = higher.iloc[-1]
+
+    if h["ema9"] > h["ema21"] and h["close"] > h["ema50"]:
+        add("CALL", 1, "Higher timeframe bullish")
+    elif h["ema9"] < h["ema21"] and h["close"] < h["ema50"]:
+        add("PUT", 1, "Higher timeframe bearish")
+
+    # 9. Fibonacci Confluence with Pivot levels
+    pivot_levels = [
+        pivot,
+        2 * pivot - pl,
+        2 * pivot - ph,
+        pivot + (ph - pl),
+        pivot - (ph - pl)
+    ]
+
+    confluence = any(
+        abs(fib - level) <= tolerance
+        for fib in fib_levels
+        for level in pivot_levels
+    )
+
+    if confluence:
+        if price > float(last["ema21"]):
+            add("CALL", 1, "Fibonacci/Pivot confluence")
+        elif price < float(last["ema21"]):
+            add("PUT", 1, "Fibonacci/Pivot confluence")
+
+    # 10. Market Structure / Liquidity Sweep
+    recent_highs, recent_lows = find_swings(tail)
+
+    if len(recent_highs) >= 2 and len(recent_lows) >= 2:
+        recent_high = max(v for _, v in recent_highs[-3:])
+        recent_low = min(v for _, v in recent_lows[-3:])
+
+        if price > recent_high:
+            add("CALL", 1, "Structure break up")
+        elif price < recent_low:
+            add("PUT", 1, "Structure break down")
+
+        if float(last["low"]) < recent_low and price > recent_low:
+            add("CALL", 1, "Sell-side liquidity sweep")
+
+        if float(last["high"]) > recent_high and price < recent_high:
+            add("PUT", 1, "Buy-side liquidity sweep")
+
+    difference = call_score - put_score
+
+    if call_score >= MIN_SCORE and difference >= 2:
+        signal, status = "CALL", "STRONGER SETUP"
+    elif put_score >= MIN_SCORE and difference <= -2:
+        signal, status = "PUT", "STRONGER SETUP"
+    else:
+        # CALL/PUT only; low-confidence signal clearly labelled
+        signal = "CALL" if difference >= 0 else "PUT"
+        status = "LOW CONFIDENCE"
+
+    return {
+        "signal": signal,
+        "status": status,
+        "call_score": call_score,
+        "put_score": put_score,
+        "price": price,
+        "time": last["datetime"],
+        "reasons": reasons
+    }
 
 
-def check_result(signal, entry_time):
-    check_at = entry_time + timedelta(minutes=1, seconds=8)
+def load_pending():
+    try:
+        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
 
-    wait_seconds = (
-        check_at - datetime.now(TZ)
-    ).total_seconds()
 
-    if wait_seconds > 0:
-        time.sleep(wait_seconds)
+def save_pending(items):
+    STATE_FILE.write_text(
+        json.dumps(items, ensure_ascii=False, indent=2),
+        encoding="utf-8"
+    )
+
+
+def check_results():
+    """
+    Approximate price-direction outcome, NOT broker settlement data.
+    """
+    pending = load_pending()
+    if not pending:
+        return
 
     try:
-        candle = find_entry_candle(entry_time)
-
-        if candle is None:
-            return "UNAVAILABLE"
-
-        op = float(candle["open"])
-        cl = float(candle["close"])
-
-        if cl == op:
-            return "DRAW"
-
-        if signal == "CALL":
-            return "PROFIT" if cl > op else "LOSS"
-
-        return "PROFIT" if cl < op else "LOSS"
-
+        df = get_candles(TIMEFRAME, 30)
     except Exception as exc:
-        print(f"Result check error: {exc}")
-        return "UNAVAILABLE"
+        print("Result check failed:", exc)
+        return
+
+    latest = df.iloc[-1]
+    latest_time = latest["datetime"]
+    remaining = []
+
+    for item in pending:
+        entry_time = pd.to_datetime(item["entry_utc"], utc=True)
+
+        if latest_time < entry_time + pd.Timedelta(minutes=1):
+            remaining.append(item)
+            continue
+
+        entry_price = float(item["entry_price"])
+        exit_price = float(latest["close"])
+
+        if item["signal"] == "CALL":
+            outcome = "PROFIT" if exit_price > entry_price else "LOSS"
+        else:
+            outcome = "PROFIT" if exit_price < entry_price else "LOSS"
+
+        if outcome == "PROFIT":
+            item["win"] += 1
+        else:
+            item["loss"] += 1
+
+        result_message = (
+            f"{SYMBOL} ( {MARKET_LABEL} )\n"
+            f"Entry Time : {item['entry_local']}\n"
+            f"RESULT : {outcome}\n"
+            f"Win : {item['win']}\n"
+            f"Loss : {item['loss']}\n"
+            f"{BOT_NAME}"
+        )
+
+        try:
+            telegram_send(result_message)
+        except Exception as exc:
+            print("Could not send result:", exc)
+            remaining.append(item)
+
+    save_pending(remaining)
 
 
-# ================= RUN BOT =================
+def get_stats():
+    try:
+        data = json.loads(Path("alamin_stats.json").read_text(encoding="utf-8"))
+        return int(data.get("win", 0)), int(data.get("loss", 0))
+    except (OSError, ValueError, TypeError):
+        return 0, 0
+
 
 def main():
-    signal, entry_time = analyze()
+    if not API_KEY or not BOT_TOKEN or not CHAT_ID:
+        raise RuntimeError(
+            "Set TWELVE_DATA_API_KEY, TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID."
+        )
 
-    direction = "UP" if signal == "CALL" else "DOWN"
+    check_results()
 
-    message = (
-        f"{SYMBOL} ( REAL MARKET )\n"
-        f"SIGNAL : {signal}\n"
-        f"ENTRY TIME : {entry_time.strftime('%H:%M')}\n"
+    df = get_candles(TIMEFRAME)
+    higher = get_candles(CONFIRM_TIMEFRAME)
+    result = analyze_market(df, higher)
+
+    # Entry is the next whole minute; local message time uses Bangladesh time.
+    now_utc = datetime.now(timezone.utc)
+    entry_utc = now_utc.replace(second=0, microsecond=0) + pd.Timedelta(minutes=1)
+    entry_local = entry_utc.tz_convert("Asia/Dhaka").strftime("%H:%M")
+
+    win, loss = get_stats()
+    pending = load_pending()
+
+    pending.append({
+        "signal": result["signal"],
+        "entry_utc": entry_utc.isoformat(),
+        "entry_local": entry_local,
+        "entry_price": result["price"],
+        "win": win,
+        "loss": loss
+    })
+    save_pending(pending)
+
+    direction = "UP" if result["signal"] == "CALL" else "DOWN"
+
+    signal_message = (
+        f"{SYMBOL} ( {MARKET_LABEL} )\n"
+        f"SIGNAL : {result['signal']}\n"
+        f"ENTRY TIME : {entry_local}\n"
         f"TIMEFRAME : 1 MINUTE\n"
         f"DIRECTION : {direction}\n"
-        f"{SIGNATURE}"
+        f"{BOT_NAME}"
     )
 
-    send_telegram(message)
-    print("Signal sent.")
-
-    result = check_result(signal, entry_time)
-
-    result_message = (
-        f"{SYMBOL} ( REAL MARKET )\n"
-        f"RESULT : {result}\n"
-        f"{SIGNATURE}"
+    telegram_send(signal_message)
+    print(signal_message)
+    print(
+        f"Analysis={result['status']} | "
+        f"CALL={result['call_score']} | PUT={result['put_score']}"
     )
-
-    send_telegram(result_message)
-    print("Result sent:", result)
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as exc:
-        print(f"BOT ERROR: {exc}")
-        raise
+    main()
